@@ -16,6 +16,11 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define MAXSYMLINKDEPTH 10
+
+// Forward declaration of create
+static struct inode* create(char*, short, short, short);
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -164,6 +169,50 @@ bad:
   return -1;
 }
 
+int
+sys_symlink(void)
+{
+  char *target_user, *linkpath_user;
+  char target[MAXPATH], linkpath[MAXPATH];
+  struct inode *ip;
+  int n;
+
+  if(argstr(0, &target_user) < 0 || argstr(1, &linkpath_user) < 0)
+    return -1;
+
+  int len = strlen(target_user);
+  if(len >= MAXPATH)
+    return -1;
+  memmove(target, target_user, len + 1);
+
+  if(strlen(linkpath_user) >= MAXPATH)
+    return -1;
+  memmove(linkpath, linkpath_user, strlen(linkpath_user) + 1);
+
+  begin_op();
+  ip = create(linkpath, T_SYMLINK, 0, 0);
+  if(ip == 0){
+    end_op();
+    return -1;
+  }
+
+  // ip is already locked by create() – do NOT call ilock() again
+  n = writei(ip, target, 0, len + 1);
+  if(n == len + 1){
+    ip->size = n;          // includes the null byte
+    iupdate(ip);
+    iunlock(ip);
+    iput(ip);
+    end_op();
+    return 0;
+  } else {
+    iunlock(ip);
+    iput(ip);
+    end_op();
+    return -1;
+  }
+}
+
 // Is the directory dp empty except for "." and ".." ?
 static int
 isdirempty(struct inode *dp)
@@ -261,6 +310,7 @@ create(char *path, short type, short major, short minor)
     panic("create: ialloc");
 
   ilock(ip);
+  ip->type = type; 
   ip->major = major;
   ip->minor = minor;
   ip->nlink = 1;
@@ -269,7 +319,6 @@ create(char *path, short type, short major, short minor)
   if(type == T_DIR){  // Create . and .. entries.
     dp->nlink++;  // for ".."
     iupdate(dp);
-    // No ip->nlink++ for ".": avoid cyclic ref count.
     if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
       panic("create dots");
   }
@@ -278,13 +327,12 @@ create(char *path, short type, short major, short minor)
     panic("create: dirlink");
 
   iunlockput(dp);
-
   return ip;
 }
 
 int
 sys_open(void)
-{
+{  
   char *path;
   int fd, omode;
   struct file *f;
@@ -306,7 +354,50 @@ sys_open(void)
       end_op();
       return -1;
     }
+
     ilock(ip);
+
+    int depth = 0;
+ 
+    //cprintf("OPEN CALLED: %s\n", path);
+
+    while(ip->type == T_SYMLINK){
+      if(depth >= MAXSYMLINKDEPTH){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      char target[MAXPATH];
+
+      if(ip->size >= MAXPATH){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      int n = readi(ip, target, 0, ip->size);
+      if(n != ip->size){
+        iunlockput(ip);
+        end_op();
+        return -1;
+      }
+
+      target[n] = '\0';   
+
+      iunlockput(ip);     // release current symlink
+
+      if((ip = namei(target)) == 0){
+        end_op();
+        return -1;
+      }
+
+      ilock(ip);
+      depth++;
+      
+      //cprintf("depth=%d resolving to %s\n", depth, target);
+    }
+
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
       end_op();
@@ -321,6 +412,7 @@ sys_open(void)
     end_op();
     return -1;
   }
+
   iunlock(ip);
   end_op();
 
@@ -329,6 +421,7 @@ sys_open(void)
   f->off = 0;
   f->readable = !(omode & O_WRONLY);
   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+
   return fd;
 }
 
